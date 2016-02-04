@@ -38,13 +38,13 @@ class Callable(object):
         self._base_state = state
 
     def call_get_return_val(self, *args):
-        return self._get_call_results(*args)[0]
+        return self.get_call_results(*args)[0]
     __call__ = call_get_return_val
 
     def call_get_res_state(self, *args):
-        return self._get_call_results(*args)[1]
+        return self.get_call_results(*args)[1]
 
-    def _get_call_results(self, *args):
+    def get_call_results(self, *args):
         cc = simuvex.DefaultCC[self._project.arch.name](self._project.arch)
         if self._ty is not None:
             wantlen = len(self._ty.args)
@@ -93,7 +93,7 @@ class Callable(object):
             if check and (not isinstance(ty, simuvex.s_type.SimTypePointer) or \
                not isinstance(ty.pts_to, simuvex.s_type.SimTypeChar)):
                 raise TypeError("Type mismatch: Expected {}, got char*".format(ty))
-            return self._standardize_value(map(ord, arg+'\0'), ty, state)
+            return self._standardize_value(map(ord, arg+'\0'), simuvex.s_type.SimTypePointer(state.arch, simuvex.s_type.SimTypeChar()), state)
         elif isinstance(arg, list):
             if check and not isinstance(ty, simuvex.s_type.SimTypePointer):
                 raise TypeError("Type mismatch: expected {}, got list".format(ty))
@@ -105,8 +105,8 @@ class Callable(object):
                 out = self._push_value(sarg, state)
             return out
         elif isinstance(arg, (int, long)):
-            return state.BVV(arg, ty.size if check else state.arch.bits)
-        elif isinstance(arg, claripy.Base):
+            return state.se.BVV(arg, ty.size if check else state.arch.bits)
+        elif isinstance(arg, claripy.ast.Base):
             return arg
 
     @staticmethod

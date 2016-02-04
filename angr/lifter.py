@@ -13,11 +13,13 @@ VEX_IRSB_MAX_INST = 99
 VEX_DEFAULT_OPT_LEVEL = 1
 
 class Lifter:
-    def __init__(self, project):
+    def __init__(self, project, cache=False):
         self._project = project
         self._thumbable = isinstance(project.arch, ArchARM)
+        self._cache_enabled = cache
+        self._block_cache = { }
 
-    def lift(self, addr, insn_bytes=None, max_size=None, num_inst=None,
+    def lift(self, addr, arch=None, insn_bytes=None, max_size=None, num_inst=None,
              traceflags=0, thumb=False, backup_state=None, opt_level=None):
         """
         Returns a pyvex block starting at address addr
@@ -47,6 +49,10 @@ class Lifter:
 
         if thumb:
             addr &= ~1
+
+        cache_key = (addr, insn_bytes, max_size, num_inst, thumb, opt_level)
+        if self._cache_enabled and cache_key in self._block_cache:
+            return self._block_cache[cache_key]
 
         # TODO: FIXME: figure out what to do if we're about to exhaust the memory
         # (we can probably figure out how many instructions we have left by talking to IDA)
@@ -80,13 +86,15 @@ class Lifter:
 
         l.debug("Creating pyvex.IRSB of arch %s at 0x%x", self._project.arch.name, addr)
 
+        arch = arch or self._project.arch
+
         pyvex.set_iropt_level(opt_level)
         try:
             if passed_max_size and not passed_num_inst:
                 irsb = pyvex.IRSB(bytes=buff,
                                   mem_addr=addr,
                                   num_bytes=max_size,
-                                  arch=self._project.arch,
+                                  arch=arch,
                                   bytes_offset=byte_offset,
                                   traceflags=traceflags)
             elif not passed_max_size and passed_num_inst:
@@ -94,7 +102,7 @@ class Lifter:
                                   mem_addr=addr,
                                   num_bytes=VEX_IRSB_MAX_SIZE,
                                   num_inst=num_inst,
-                                  arch=self._project.arch,
+                                  arch=arch,
                                   bytes_offset=byte_offset,
                                   traceflags=traceflags)
             elif passed_max_size and passed_num_inst:
@@ -102,14 +110,14 @@ class Lifter:
                                   mem_addr=addr,
                                   num_bytes=min(size, max_size),
                                   num_inst=num_inst,
-                                  arch=self._project.arch,
+                                  arch=arch,
                                   bytes_offset=byte_offset,
                                   traceflags=traceflags)
             else:
                 irsb = pyvex.IRSB(bytes=buff,
                                   mem_addr=addr,
                                   num_bytes=min(size, max_size),
-                                  arch=self._project.arch,
+                                  arch=arch,
                                   bytes_offset=byte_offset,
                                   traceflags=traceflags)
         except pyvex.PyVEXError:
@@ -127,11 +135,14 @@ class Lifter:
                     continue
                 if self._project.is_hooked(stmt.addr):
                     size = stmt.addr - real_addr
-                    irsb = pyvex.IRSB(bytes=buff, mem_addr=addr, num_bytes=size, arch=self._project.arch, bytes_offset=byte_offset, traceflags=traceflags)
+                    irsb = pyvex.IRSB(bytes=buff, mem_addr=addr, num_bytes=size, arch=arch, bytes_offset=byte_offset, traceflags=traceflags)
                     break
 
         irsb = self._post_process(irsb)
-        return Block(buff, irsb, thumb)
+        b = Block(buff, irsb, thumb)
+        if self._cache_enabled:
+            self._block_cache[cache_key] = b
+        return b
 
     @staticmethod
     def _bytes_from_state(backup_state, addr, max_size):
@@ -139,7 +150,7 @@ class Lifter:
 
         for i in range(addr, addr + max_size):
             if i in backup_state.memory:
-                val = backup_state.memory.load(backup_state.BVV(i), backup_state.BVV(1))
+                val = backup_state.memory.load(i, 1)
                 try:
                     val = backup_state.se.exactly_n_int(val, 1)[0]
                     val = chr(val)

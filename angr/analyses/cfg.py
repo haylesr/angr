@@ -1,115 +1,24 @@
 from collections import defaultdict
 import logging
 
+import itertools
 import networkx
+
 import pyvex
 import simuvex
 import claripy
 from archinfo import ArchARM
 
-import angr
+from ..functionmanager import FunctionManager
 from ..entry_wrapper import EntryWrapper
-from .cfg_base import CFGBase
 from ..analysis import Analysis, register_analysis
-from ..errors import AngrCFGError, AngrError, AngrBackwardSlicingError
+from ..errors import AngrCFGError, AngrError
+from ..path import make_path
+from .cfg_node import CFGNode
+from .cfg_base import CFGBase
 
 l = logging.getLogger(name="angr.analyses.cfg")
 
-class CFGNode(object):
-    '''
-    This class stands for each single node in CFG.
-    '''
-    def __init__(self, callstack_key, addr, size, cfg, input_state=None, simprocedure_name=None, syscall_name=None,
-                 looping_times=0, no_ret=False, is_syscall=False, syscall=None, simrun=None, function_address=None,
-                 final_states=None):
-        '''
-        Note: simprocedure_name is not used to recreate the SimProcedure object. It's only there for better
-        __repr__.
-        '''
-
-        self.callstack_key = callstack_key
-        self.addr = addr
-        self.input_state = input_state
-        self.simprocedure_name = simprocedure_name
-        self.syscall_name = syscall_name
-        self.size = size
-        self.looping_times = looping_times
-        self.no_ret = no_ret
-        self.is_syscall = is_syscall
-        self.syscall = syscall
-        self._cfg = cfg
-        self.function_address = function_address
-        self.name = simprocedure_name or cfg.project.loader.find_symbol_name(addr)
-        if function_address and self.name is None:
-            self.name = cfg.project.loader.find_symbol_name(function_address)
-            if self.name is not None:
-                self.name = "%s+0x%x" % (self.name, (addr - function_address))
-
-        # If this CFG contains an Ijk_Call, `return_target` stores the returning site.
-        # Note: this is regardless of whether the call returns or not. You should always check the `no_ret` property if
-        # you are using `return_target` to do some serious stuff.
-        self.return_target = None
-
-        self.instruction_addrs = [ ]
-        if not self.is_simprocedure and simrun is not None:
-            # This is a SimIRSB
-            # Grab all instruction addresses out!
-            irsb = simrun.irsb
-            self.instruction_addrs = [ s.addr for s in irsb.statements if type(s) is pyvex.IRStmt.IMark ]  # pylint:disable=unidiomatic-typecheck
-
-        self.final_states = [ ] if final_states is None else final_states
-
-    @property
-    def successors(self):
-        return self._cfg.get_successors(self)
-
-    @property
-    def predecessors(self):
-        return self._cfg.get_predecessors(self)
-
-    @property
-    def is_simprocedure(self):
-        return self.simprocedure_name is not None
-
-
-    def copy(self):
-        c = CFGNode(self.callstack_key,
-                    self.addr,
-                    self.size,
-                    self._cfg,
-                    self.input_state,
-                    self.simprocedure_name,
-                    self.looping_times,
-                    self.no_ret,
-                    self.is_syscall,
-                    self.syscall,
-                    self.function_address,
-                    final_states=self.final_states[ :: ])
-        c.instruction_addrs = self.instruction_addrs[ :: ]
-        return c
-
-    def __repr__(self):
-        if self.name is not None:
-            s = "<CFGNode %s (0x%x) [%d]>" % (self.name, self.addr, self.looping_times)
-        else:
-            s = "<CFGNode 0x%x (%d) [%d]>" % (self.addr, self.size, self.looping_times)
-
-        return s
-
-    def __eq__(self, other):
-        if isinstance(other, simuvex.SimIRSB) or isinstance(other, simuvex.SimProcedure):
-            raise ValueError("You do not want to be comparing a SimRun to a CFGNode.")
-        if not isinstance(other, CFGNode):
-            return False
-        return (self.callstack_key == other.callstack_key and
-                self.addr == other.addr and
-                self.size == other.size and
-                self.looping_times == other.looping_times and
-                self.simprocedure_name == other.simprocedure_name
-                )
-
-    def __hash__(self):
-        return hash((self.callstack_key, self.addr, self.looping_times, self.simprocedure_name))
 
 class PendingExit(object):
     def __init__(self, returning_source, state, bbl_stack, call_stack):
@@ -138,12 +47,15 @@ class PendingExit(object):
 
     def __repr__(self):
         return "<PendingExit to %s, from function %s>" % (self.state.ip,
-                                      hex(self.returning_source) if self.returning_source is not None else 'Unknown')
+                                                          hex(
+                                                              self.returning_source) if self.returning_source is not None else 'Unknown')
+
 
 class CFG(Analysis, CFGBase):
-    '''
+    """
     This class represents a control-flow graph.
-    '''
+    """
+
     def __init__(self, context_sensitivity_level=1,
                  start=None,
                  avoid_runs=None,
@@ -152,13 +64,13 @@ class CFG(Analysis, CFGBase):
                  call_tracing_filter=None,
                  initial_state=None,
                  starts=None,
-                 keep_input_state=False,
+                 keep_state=False,
                  enable_advanced_backward_slicing=False,
                  enable_symbolic_back_traversal=False,
                  additional_edges=None,
                  no_construct=False
-                ):
-        '''
+                 ):
+        """
         All of these parameters are optional.
         :param context_sensitivity_level: The level of context-sensitivity of this CFG.
                                         It ranges from 0 to infinity. Default 1.
@@ -168,13 +80,13 @@ class CFG(Analysis, CFGBase):
         :param call_tracing_filter: ??? what the hell is this
         :param initial_state: An initial state to use to begin analysis
         :param starts: A list of addresses at which to begin analysis
-        :param keep_input_state: Whether to keep the SimStates for each CFGNode
+        :param keep_state: Whether to keep the SimStates for each CFGNode
         :param enable_advanced_backward_slicing
         :param enable_symbolic_back_traversal
         :param additional_edges: a dict mapping addresses of basic blocks to addresses of
                             successors to manually include and analyze forward from.
         :param no_construct: Skip the construction procedure. Only used in unit-testing.
-        '''
+        """
         CFGBase.__init__(self, self.project, context_sensitivity_level)
         self._symbolic_function_initial_state = {}
         self._function_input_states = None
@@ -198,10 +110,14 @@ class CFG(Analysis, CFGBase):
         self._call_depth = call_depth
         self._call_tracing_filter = call_tracing_filter
         self._initial_state = initial_state
-        self._keep_input_state = keep_input_state
+        self._keep_state = keep_state
         self._enable_advanced_backward_slicing = enable_advanced_backward_slicing
         self._enable_symbolic_back_traversal = enable_symbolic_back_traversal
-        self._additional_edges = additional_edges if additional_edges else { }
+        self._additional_edges = additional_edges if additional_edges else {}
+        # Stores the index for each CFGNode in this CFG after a quasi-topological sort (currently a DFS)
+        self._quasi_topological_order = {}
+        # A copy of all entry points in this CFG. Integers
+        self._entry_points = []
 
         # Sanity checks
 
@@ -218,14 +134,14 @@ class CFG(Analysis, CFGBase):
         if self._enable_advanced_backward_slicing and self._enable_symbolic_back_traversal:
             raise AngrCFGError('Advanced backward slicing and symbolic back traversal cannot both be enabled.')
 
-        if self._enable_advanced_backward_slicing and not self._keep_input_state:
-            raise AngrCFGError('Keep input state must be enabled if advanced backward slicing is enabled.')
+        if self._enable_advanced_backward_slicing and not self._keep_state:
+            raise AngrCFGError('Keep state must be enabled if advanced backward slicing is enabled.')
 
         # Addresses of basic blocks who has an indirect jump as their default exit
         self.resolved_indirect_jumps = set()
         self.unresolved_indirect_jumps = set()
 
-        self._executable_address_ranges = [ ]
+        self._executable_address_ranges = []
         self._initialize_executable_ranges()
 
         if not no_construct:
@@ -236,7 +152,6 @@ class CFG(Analysis, CFGBase):
         new_cfg = CFG.__new__(CFG)
         new_cfg.named_errors = dict(self.named_errors)
         new_cfg.errors = list(self.errors)
-        new_cfg.log = list(self.log)
         new_cfg._fail_fast = self._fail_fast
         new_cfg.project = self.project
 
@@ -246,9 +161,12 @@ class CFG(Analysis, CFGBase):
         new_cfg._edge_map = self._edge_map.copy()
         new_cfg._loop_back_edges_set = self._loop_back_edges_set.copy()
         new_cfg._loop_back_edges = self._loop_back_edges[::]
+        new_cfg._executable_address_ranges = self._executable_address_ranges[::]
+        new_cfg._unresolvable_runs = self._unresolvable_runs.copy()
         new_cfg._overlapped_loop_headers = self._overlapped_loop_headers[::]
         new_cfg._function_manager = self._function_manager
         new_cfg._thumb_addrs = self._thumb_addrs.copy()
+        new_cfg._keep_state = self._keep_state
         new_cfg.project = self.project
         new_cfg.resolved_indirect_jumps = self.resolved_indirect_jumps.copy()
         new_cfg.unresolved_indirect_jumps = self.unresolved_indirect_jumps.copy()
@@ -257,10 +175,10 @@ class CFG(Analysis, CFGBase):
 
     @property
     def unresolvables(self):
-        '''
+        """
         Get those SimRuns that have non-resolvable exits
         :return:
-        '''
+        """
         return self._unresolvable_runs
 
     @property
@@ -291,36 +209,37 @@ class CFG(Analysis, CFGBase):
                     self._executable_address_ranges.append((min_addr, max_addr))
 
     def _construct(self):
-        '''
+        """
         Construct the CFG.
 
         Fastpath means the CFG generation will work in an IDA-like way, in
         which it will not try to execute every single statement in the emulator,
         but will just do the decoding job. This is much faster than the old
         way.
-        '''
+        """
 
-        avoid_runs = [ ] if self._avoid_runs is None else self._avoid_runs
+        avoid_runs = [] if self._avoid_runs is None else self._avoid_runs
 
         # Create the function manager
-        self._function_manager = angr.FunctionManager(self.project, self)
+        self._function_manager = FunctionManager(self.project, self)
 
         # Save input states of functions. It will be discarded at the end of this function.
-        self._function_input_states = { }
+        self._function_input_states = {}
 
         self._initialize_cfg()
 
         # Traverse all the IRSBs, and put the corresponding CFGNode objects to a dict
         # It's actually a multi-dict, as we care about contexts.
-        self._nodes = { }
+        self._nodes = {}
         if self._starts is None:
-            entry_points = (self.project.entry, )
+            entry_points = (self.project.entry,)
         else:
             entry_points = self._starts
+        self._entry_points = entry_points  # Make a copy
 
         l.debug('CFG construction begins')
 
-        remaining_entries = [ ]
+        remaining_entries = []
         # Counting how many times a basic block is traced into
         traced_sim_blocks = defaultdict(lambda: defaultdict(int))
 
@@ -329,7 +248,7 @@ class CFG(Analysis, CFGBase):
             jumpkind = None
             if isinstance(ep, tuple):
                 # We support tuples like (addr, jumpkind)
-                ep, jumpkind = ep # pylint: disable=unpacking-non-sequence
+                ep, jumpkind = ep  # pylint: disable=unpacking-non-sequence
 
             if self._initial_state is None:
                 loaded_state = self.project.factory.entry_state(mode="fastpath")
@@ -378,7 +297,7 @@ class CFG(Analysis, CFGBase):
         # A dict to record all blocks that returns to a specific address
         self.return_target_sources = defaultdict(list)
         # A dict that collects essential parameters to properly reconstruct initial state for a SimRun
-        simrun_info_collection = { }
+        simrun_info_collection = {}
 
         pending_function_hints = set()
 
@@ -391,11 +310,11 @@ class CFG(Analysis, CFGBase):
             entry_wrapper = remaining_entries.pop()
             # Process the popped exit
             self._handle_entry(entry_wrapper, remaining_entries,
-                              exit_targets, pending_exits,
-                              traced_sim_blocks, self.return_target_sources,
-                              avoid_runs, simrun_info_collection,
-                              pending_function_hints, analyzed_addrs,
-                              non_returning_functions)
+                               exit_targets, pending_exits,
+                               traced_sim_blocks, self.return_target_sources,
+                               avoid_runs, simrun_info_collection,
+                               pending_function_hints, analyzed_addrs,
+                               non_returning_functions)
 
             if not len(remaining_entries) and len(pending_exits):
                 # There are not remaining entries, but only pending exits left. Each pending exit corresponds to a
@@ -429,7 +348,7 @@ class CFG(Analysis, CFGBase):
                 # Let's check whether this address has been traced before.
                 if any(r == pending_exit_tuple for r in exit_targets):
                     # That block has been traced before. Let's forget about it
-                    l.debug("Target 0x%08x has been traced before." + \
+                    l.debug("Target 0x%08x has been traced before." +
                             "Trying the next one...", pending_exit_addr)
                     continue
 
@@ -442,9 +361,9 @@ class CFG(Analysis, CFGBase):
 
                 new_path = self.project.factory.path(pending_exit_state)
                 new_path_wrapper = EntryWrapper(new_path,
-                                                  self._context_sensitivity_level,
-                                                  call_stack=pending_exit_call_stack,
-                                                  bbl_stack=pending_exit_bbl_stack)
+                                                self._context_sensitivity_level,
+                                                call_stack=pending_exit_call_stack,
+                                                bbl_stack=pending_exit_bbl_stack)
                 remaining_entries.append(new_path_wrapper)
                 l.debug("Tracing a missing retn exit %s", self._simrun_key_repr(pending_exit_tuple))
                 break
@@ -465,7 +384,7 @@ class CFG(Analysis, CFGBase):
 
                         new_path = self.project.factory.path(new_state)
                         new_path_wrapper = EntryWrapper(new_path,
-                                                       self._context_sensitivity_level)
+                                                        self._context_sensitivity_level)
                         remaining_entries.append(new_path_wrapper)
                         l.debug('Picking a function 0x%x from pending function hints.', f)
                         self._function_manager._create_function_if_not_exist(new_path_wrapper.current_function_address)
@@ -514,22 +433,21 @@ class CFG(Analysis, CFGBase):
         # Adding edges
         for tpl, targets in exit_targets.iteritems():
 
-            src_node = self._nodes[tpl] # Cannot fail :)
+            src_node = self._nodes[tpl]  # Cannot fail :)
 
             for target in targets:
                 node_key, jumpkind, exit_stmt_idx = target
                 if node_key not in self._nodes:
                     # Generate a PathTerminator node
-                    # pt = simuvex.procedures.SimProcedures["stubs"]["PathTerminator"](self.project.factory.entry_state(), addr=ex[-1])
                     addr = self._simrun_key_addr(node_key)
-                    pt = CFGNode(callstack_key=self._simrun_key_callstack_key(node_key),
-                                 addr=self._simrun_key_addr(node_key),
-                                 size=None,
-                                 cfg=self,
+                    pt = CFGNode(self._simrun_key_addr(node_key),
+                                 None,
+                                 self,
+                                 callstack_key=self._simrun_key_callstack_key(node_key),
                                  input_state=None,
                                  simprocedure_name="PathTerminator",
                                  function_address=self._simrun_key_addr(node_key))
-                    if self._keep_input_state:
+                    if self._keep_state:
                         # We don't have an input state available for it (otherwise we won't have to create a
                         # PathTerminator). This is just a trick to make get_any_irsb() happy.
                         pt.input_state = self.project.factory.entry_state()
@@ -549,7 +467,7 @@ class CFG(Analysis, CFGBase):
                 ret_addr = None
                 if jumpkind == 'Ijk_Call':
                     target_function = self.function_manager.function(dest_node.addr)
-                    if target_function is None or target_function.returning != False:
+                    if target_function is None or target_function.returning is not False:
                         ret_addr = src_node.return_target
 
                 # Update transition graph for functions
@@ -566,7 +484,7 @@ class CFG(Analysis, CFGBase):
                     for src_irsb_key in return_target_sources[src_node.addr]:
                         if src_irsb_key in self._nodes:
                             cfg.add_edge(self._nodes[src_irsb_key],
-                                           src_node, jumpkind="Ijk_Ret", exit_stmt_idx='default')
+                                         src_node, jumpkind="Ijk_Ret", exit_stmt_idx='default')
 
         return cfg
 
@@ -585,7 +503,6 @@ class CFG(Analysis, CFGBase):
 
         # Update the transition graph of current function
         if jumpkind == "Ijk_Call":
-
             self._function_manager.call_to(
                 function_addr=src_func_addr,
                 from_addr=src_addr,
@@ -600,7 +517,7 @@ class CFG(Analysis, CFGBase):
                 function_addr=src_func_addr,
                 from_addr=src_addr,
                 to_addr=dest_addr,
-                retn_addr=src_addr, # For syscalls, they are returning to the address of themselves
+                retn_addr=src_addr,  # For syscalls, they are returning to the address of themselves
                 syscall=True,
             )
 
@@ -641,7 +558,7 @@ class CFG(Analysis, CFGBase):
                     function_addr=src_func_addr,
                     from_addr=src_addr,
                     to_addr=dest_addr,
-                    retn_addr=None, # TODO
+                    retn_addr=None,  # TODO
                     syscall=False
                 )
 
@@ -652,17 +569,18 @@ class CFG(Analysis, CFGBase):
                 self._reg_offset = reg_offset
                 self._info_collection = info_collection
 
-            def write_persistent_register(self, state):
-                if state.inspect.address is None:
+            def write_persistent_register(self, state_):
+                if state_.inspect.address is None:
                     l.error('state.inspect.address is None. It will be fixed by Yan later.')
                     return
 
-                if state.registers.load(self._reg_offset).symbolic:
-                    current_run = state.inspect.address
+                if state_.registers.load(self._reg_offset).symbolic:
+                    current_run = state_.inspect.address
                     if current_run in self._info_collection and \
-                            not state.se.symbolic(self._info_collection[current_run][self._reg_offset]):
-                        l.debug("Overwriting %s with %s", state.registers.load(self._reg_offset), self._info_collection[current_run][self._reg_offset])
-                        state.registers.store(
+                            not state_.se.symbolic(self._info_collection[current_run][self._reg_offset]):
+                        l.debug("Overwriting %s with %s", state_.registers.load(self._reg_offset),
+                                self._info_collection[current_run][self._reg_offset])
+                        state_.registers.store(
                             self._reg_offset,
                             self._info_collection[current_run][self._reg_offset]
                         )
@@ -704,11 +622,11 @@ class CFG(Analysis, CFGBase):
             for n in queue:
                 # Start symbolic exploration from each block
                 state = self.project.factory.blank_state(addr=n.addr,
-                                                          mode='symbolic',
-                                                          add_options={
-                                                              simuvex.o.DO_RET_EMULATION,
-                                                              simuvex.o.CONSERVATIVE_READ_STRATEGY,
-                                                          } | simuvex.o.resilience_options
+                                                         mode='symbolic',
+                                                         add_options={
+                                                                         simuvex.o.DO_RET_EMULATION,
+                                                                         simuvex.o.CONSERVATIVE_READ_STRATEGY,
+                                                                     } | simuvex.o.resilience_options
                                                          )
                 # Avoid concretization of any symbolic read address that is over a certain limit
                 # TODO: test case is needed for this option
@@ -725,26 +643,27 @@ class CFG(Analysis, CFGBase):
                                                      reg_write_offset=state.arch.registers[reg][0],
                                                      action=reg_protector.write_persistent_register
                                                  )
-                    )
-                result = angr.surveyors.Explorer(self.project,
-                                                 start=self.project.factory.path(state),
-                                                 find=(current_simrun.addr, ),
-                                                 avoid=avoid,
-                                                 max_repeats=10,
-                                                 max_depth=path_length).run()
+                                                 )
+                result = self.project.surveyors.Explorer(
+                    start=self.project.factory.path(state),
+                    find=(current_simrun.addr,),
+                    avoid=avoid,
+                    max_repeats=10,
+                    max_depth=path_length
+                ).run()
                 if result.found:
                     if not result.found[0].errored and len(result.found[0].step()) > 0:
                         # Make sure we don't throw any exception here by checking the path.errored attribute first
                         keep_running = False
-                        concrete_exits.extend([ s for s in result.found[0].next_run.flat_successors ])
-                        concrete_exits.extend([ s for s in result.found[0].next_run.unsat_successors ])
+                        concrete_exits.extend([s for s in result.found[0].next_run.flat_successors])
+                        concrete_exits.extend([s for s in result.found[0].next_run.unsat_successors])
                 if keep_running:
                     l.debug('Step back for one more run...')
 
         # Make sure these successors are actually concrete
         # We just use the ip, persistent registers, and jumpkind to initialize the original unsat state
         # TODO: It works for jumptables, but not for calls. We should also handle changes in sp
-        new_concrete_successors = [ ]
+        new_concrete_successors = []
         for c in concrete_exits:
             unsat_state = current_simrun.unsat_successors[0].copy()
             unsat_state.scratch.jumpkind = c.scratch.jumpkind
@@ -755,13 +674,13 @@ class CFG(Analysis, CFGBase):
         return new_concrete_successors
 
     def _get_symbolic_function_initial_state(self, function_addr, fastpath_mode_state=None):
-        '''
+        """
         Symbolically execute the first basic block of the specified function,
         then returns it. We prepares the state using the already existing
         state in fastpath mode (if avaiable).
         :param function_addr: The function address
         :return: A symbolic state if succeeded, None otherwise
-        '''
+        """
         if function_addr is None:
             return None
 
@@ -779,12 +698,12 @@ class CFG(Analysis, CFGBase):
         symbolic_initial_state = self.project.factory.entry_state(mode='symbolic')
         if fastpath_state is not None:
             symbolic_initial_state = self.project.simos.prepare_call_state(fastpath_state,
-                                                    initial_state=symbolic_initial_state)
+                                                                           initial_state=symbolic_initial_state)
 
         # Create a temporary block
         try:
             tmp_block = self.project.block(function_addr)
-        except (simuvex.SimError, angr.AngrError):
+        except (simuvex.SimError, AngrError):
             return None
 
         num_instr = tmp_block.instructions - 1
@@ -793,7 +712,7 @@ class CFG(Analysis, CFGBase):
         path = self.project.factory.path(symbolic_initial_state)
         try:
             simrun = self.project.factory.sim_run(path.state, num_inst=num_instr)
-        except (simuvex.SimError, angr.AngrError):
+        except (simuvex.SimError, AngrError):
             return None
 
         # We execute all but the last instruction in this basic block, so we have a cleaner
@@ -837,15 +756,19 @@ class CFG(Analysis, CFGBase):
                 # instance.
 
                 old_proc = self.project._sim_procedures[addr][0]
+                old_name = None
                 if old_proc == simuvex.procedures.SimProcedures["stubs"]["ReturnUnconstrained"]:
-                    old_name = self.project._sim_procedures[addr][1]['resolves']
-                else:
+                    proc_kwargs = self.project._sim_procedures[addr][1]
+                    if 'resolves' in proc_kwargs:
+                        old_name = proc_kwargs['resolves']
+
+                if old_name is None:
                     old_name = old_proc.__name__.split('.')[-1]
 
                 sim_run = simuvex.procedures.SimProcedures["stubs"]["ReturnUnconstrained"](
                     state,
                     addr=addr,
-                    sim_kwargs={ 'resolves': "%s" % old_name }
+                    sim_kwargs={'resolves': "%s" % old_name}
                 )
             else:
                 jumpkind = state.scratch.jumpkind
@@ -853,58 +776,76 @@ class CFG(Analysis, CFGBase):
                 sim_run = self.project.factory.sim_run(current_entry.state, jumpkind=jumpkind)
 
         except (simuvex.SimFastPathError, simuvex.SimSolverModeError) as ex:
-            # Got a SimFastPathError. We wanna switch to symbolic mode for current IRSB.
-            l.debug('Switch to symbolic mode for address 0x%x', addr)
-            # Make a copy of the current 'fastpath' state
 
-            l.debug('Symbolic jumps at basic block 0x%x.' % addr)
+            if saved_state.mode == 'fastpath':
+                # Got a SimFastPathError or SimSolverModeError in FastPath mode.
+                # We wanna switch to symbolic mode for current IRSB.
+                l.debug('Switch to symbolic mode for address 0x%x', addr)
+                # Make a copy of the current 'fastpath' state
 
-            new_state = None
-            if addr != current_function_addr:
-                new_state = self._get_symbolic_function_initial_state(current_function_addr)
+                l.debug('Symbolic jumps at basic block 0x%x.' % addr)
 
-            if new_state is None:
-                new_state = current_entry.state.copy()
-                new_state.set_mode('symbolic')
-            new_state.options.add(simuvex.o.DO_RET_EMULATION)
-            # Remove bad constraints
-            # FIXME: This is so hackish...
-            new_state.se._solver.constraints = [ c for c in new_state.se.constraints if c.op != 'I' or c.args[0] is not False ]
-            new_state.se._solver._result = None
-            # Swap them
-            saved_state, current_entry.state = current_entry.state, new_state
-            sim_run, error_occurred, _ = self._get_simrun(addr, current_entry)
-        except simuvex.SimIRSBError as ex:
+                new_state = None
+                if addr != current_function_addr:
+                    new_state = self._get_symbolic_function_initial_state(current_function_addr)
+
+                if new_state is None:
+                    new_state = current_entry.state.copy()
+                    new_state.set_mode('symbolic')
+                new_state.options.add(simuvex.o.DO_RET_EMULATION)
+                # Remove bad constraints
+                # FIXME: This is so hackish...
+                new_state.se._solver.constraints = [c for c in new_state.se.constraints if
+                                                    c.op != 'I' or c.args[0] is not False]
+                new_state.se._solver._result = None
+                # Swap them
+                saved_state, current_entry.state = current_entry.state, new_state
+                sim_run, error_occurred, _ = self._get_simrun(addr, current_entry)
+
+            else:
+                # Got a SimSolverModeError in symbolic mode. We are screwed.
+                # Skip this IRSB
+                l.debug("Caught a SimIRSBError. Don't panic, this is usually expected.", ex)
+                error_occurred = True
+                sim_run = \
+                    simuvex.procedures.SimProcedures["stubs"]["PathTerminator"](
+                        state, addr=addr)
+
+        except simuvex.SimIRSBError:
             # It's a tragedy that we came across some instructions that VEX
             # does not support. I'll create a terminating stub there
-            l.error("SimIRSBError occurred(%s). Creating a PathTerminator.", ex)
+            l.debug("Caught a SimIRSBError during CFG recovery. Creating a PathTerminator.", exc_info=True)
             error_occurred = True
             sim_run = \
                 simuvex.procedures.SimProcedures["stubs"]["PathTerminator"](
                     state, addr=addr)
-        except claripy.ClaripyError as ex:
-           l.error("ClaripyError: ", exc_info=True)
-           error_occurred = True
-           # Generate a PathTerminator to terminate the current path
-           sim_run = \
-               simuvex.procedures.SimProcedures["stubs"]["PathTerminator"](
-                   state, addr=addr)
-        except simuvex.SimError as ex:
-            l.error("SimError: ", exc_info=True)
+
+        except claripy.ClaripyError:
+            l.debug("Caught a ClaripyError during CFG recovery. Don't panic, this is usually expected.", exc_info=True)
+            error_occurred = True
+            # Generate a PathTerminator to terminate the current path
+            sim_run = \
+                simuvex.procedures.SimProcedures["stubs"]["PathTerminator"](
+                    state, addr=addr)
+
+        except simuvex.SimError:
+            l.debug("Caught a SimError when during CFG recovery. Don't panic, this is usually expected.", exc_info=True)
 
             error_occurred = True
             # Generate a PathTerminator to terminate the current path
             sim_run = \
                 simuvex.procedures.SimProcedures["stubs"]["PathTerminator"](
                     state, addr=addr)
-        except angr.errors.AngrError as ex:
+
+        except AngrError:
             section = self.project.loader.main_bin.find_section_containing(addr)
             if section is None:
                 sec_name = 'No section'
             else:
                 sec_name = section.name
-            l.error("AngrError %s when creating SimRun at 0x%x (%s)",
-                    ex, addr, sec_name)
+            # AngrError shouldn't really happen though
+            l.error("Caught an AngrError during CFG recovery at %#x (%s)",
+                    addr, sec_name, exc_info=True)
             # We might be on a wrong branch, and is likely to encounter the
             # "No bytes in memory xxx" exception
             # Just ignore it
@@ -925,7 +866,7 @@ class CFG(Analysis, CFGBase):
         them into pending_exits
         '''
 
-        function_hints = [ ]
+        function_hints = []
         if isinstance(simrun, simuvex.SimIRSB) and simrun.successors:
             successor = simrun.successors[0]
             for action in successor.log.actions:
@@ -939,27 +880,29 @@ class CFG(Analysis, CFGBase):
                 # Enumerate actions
                 data = action.data
                 if data is not None:
-                    # TODO: Check if there is a proper way to tell whether this const falls in the range of code segments
+                    # TODO: Check if there is a proper way to tell whether this const falls in the range of code
+                    # TODO: segments
                     # Now let's live with this big hack...
                     try:
                         const = successor.se.exactly_n_int(data.ast, 1)[0]
-                    except: # pylint: disable=bare-except
+                    except:  # pylint: disable=bare-except
                         continue
 
                     if self._is_address_executable(const):
                         if function_hints_found is not None and const in function_hints_found:
                             continue
 
-                        #target = const
-                        #tpl = (None, None, target)
-                        #st = self.project.simos.prepare_call_state(self.project.initial_state(mode='fastpath'),
+                        # target = const
+                        # tpl = (None, None, target)
+                        # st = self.project.simos.prepare_call_state(self.project.initial_state(mode='fastpath'),
                         #                                           initial_state=saved_state)
-                        #st = self.project.initial_state(mode='fastpath')
-                        #exits[tpl] = (st, None, None)
+                        # st = self.project.initial_state(mode='fastpath')
+                        # exits[tpl] = (st, None, None)
 
                         function_hints.append(const)
 
-            l.info('Got %d possible exits from %s, including: %s', len(function_hints), simrun, ", ".join(["0x%x" % f for f in function_hints]))
+            l.info('Got %d possible exits from %s, including: %s', len(function_hints), simrun,
+                   ", ".join(["0x%x" % f for f in function_hints]))
 
         return function_hints
 
@@ -1037,7 +980,7 @@ class CFG(Analysis, CFGBase):
     @staticmethod
     def _generate_simrun_key(call_stack_suffix, simrun_addr, is_syscall):
         if not is_syscall:
-            return call_stack_suffix + (simrun_addr, 'normal' )
+            return call_stack_suffix + (simrun_addr, 'normal')
         else:
             return call_stack_suffix + (simrun_addr, 'syscall')
 
@@ -1046,7 +989,7 @@ class CFG(Analysis, CFGBase):
         runtype = simrun_key[-1]
         addr = simrun_key[-2]
 
-        callstack = [ ]
+        callstack = []
         for i in xrange(0, len(simrun_key) - 2, 2):
             from_ = 'None' if simrun_key[i] is None else hex(simrun_key[i])
             to_ = 'None' if simrun_key[i + 1] is None else hex(simrun_key[i + 1])
@@ -1057,16 +1000,16 @@ class CFG(Analysis, CFGBase):
 
     @staticmethod
     def _simrun_key_callstack_key(simrun_key):
-        return simrun_key[ : -2]
+        return simrun_key[: -2]
 
     @staticmethod
     def _simrun_key_addr(simrun_key):
         return simrun_key[-2]
 
     def _handle_entry(self, entry_wrapper, remaining_exits, exit_targets,
-                     pending_exits, traced_sim_blocks, retn_target_sources,
-                     avoid_runs, simrun_info_collection, function_hints_found,
-                     analyzed_addrs, non_returning_functions):
+                      pending_exits, traced_sim_blocks, retn_target_sources,
+                      avoid_runs, simrun_info_collection, function_hints_found,
+                      analyzed_addrs, non_returning_functions):
         """
         Handles an entry.
 
@@ -1085,10 +1028,11 @@ class CFG(Analysis, CFGBase):
         current_stack_pointer = entry_wrapper.current_stack_pointer
         accessed_registers_in_function = entry_wrapper.current_function_accessed_registers
         current_function = self._function_manager.function(current_function_addr, create_if_not_exist=True)
-        jumpkind = 'Ijk_Boring' if current_entry.state.scratch.jumpkind is None else current_entry.state.scratch.jumpkind
+        jumpkind = 'Ijk_Boring' if current_entry.state.scratch.jumpkind is None else \
+            current_entry.state.scratch.jumpkind
 
         # Log this address
-        if l.level <= logging.DEBUG:
+        if l.level == logging.DEBUG:
             analyzed_addrs.add(addr)
 
         if addr == current_function_addr:
@@ -1100,7 +1044,7 @@ class CFG(Analysis, CFGBase):
         #
 
         simrun, error_occured, _ = self._get_simrun(addr, current_entry,
-            current_function_addr=current_function_addr)
+                                                    current_function_addr=current_function_addr)
         if simrun is None:
             # We cannot retrieve the SimRun...
             return
@@ -1142,10 +1086,10 @@ class CFG(Analysis, CFGBase):
             if (syscall is None and simrun.NO_RET) or (syscall is not None and simrun.syscall.NO_RET):
                 no_ret = True
 
-            cfg_node = CFGNode(call_stack_suffix,
-                               simrun.addr,
+            cfg_node = CFGNode(simrun.addr,
                                None,
                                self,
+                               callstack_key=call_stack_suffix,
                                input_state=None,
                                simprocedure_name=simproc_name,
                                syscall_name=syscall,
@@ -1155,17 +1099,17 @@ class CFG(Analysis, CFGBase):
                                function_address=simrun.addr)
 
         else:
-            cfg_node = CFGNode(call_stack_suffix,
-                               simrun.addr,
+            cfg_node = CFGNode(simrun.addr,
                                simrun.irsb.size,
                                self,
+                               callstack_key=call_stack_suffix,
                                input_state=None,
                                is_syscall=is_syscall,
                                syscall=syscall,
                                simrun=simrun,
                                function_address=current_function_addr)
 
-        if self._keep_input_state:
+        if self._keep_state:
             cfg_node.input_state = simrun.initial_state
 
         node_key = simrun_key
@@ -1177,13 +1121,13 @@ class CFG(Analysis, CFGBase):
         # For ARM THUMB mode
         if isinstance(simrun, simuvex.SimIRSB) and current_entry.state.thumb:
             self._thumb_addrs.update(simrun.imark_addrs())
-            self._thumb_addrs.update(map(lambda x: x+1, simrun.imark_addrs()))
+            self._thumb_addrs.update(map(lambda x: x + 1, simrun.imark_addrs()))
 
         #
         # Get all successors of this SimRun
         #
 
-        all_successors = (simrun.flat_successors + simrun.unsat_successors) if addr not in avoid_runs else [ ]
+        all_successors = (simrun.flat_successors + simrun.unsat_successors) if addr not in avoid_runs else []
 
         if simrun.initial_state.thumb and isinstance(simrun, simuvex.SimIRSB):
             pyvex.set_iropt_level(0)
@@ -1223,22 +1167,22 @@ class CFG(Analysis, CFGBase):
                 if cs_insn.mnemonic in THUMB_BRANCH_INSTRUCTIONS:
                     can_produce_exits.add(cs_insn.address)
 
-            all_successors = filter(lambda state: state.scratch.ins_addr in can_produce_exits or \
+            all_successors = filter(lambda state: state.scratch.ins_addr in can_produce_exits or
                                                   state.scratch.stmt_idx == simrun.num_stmts,
                                     all_successors)
 
-        if self._keep_input_state:
+        if self._keep_state:
             cfg_node.final_states = all_successors[::]
 
         # If there is a call exit, we shouldn't put the default exit (which
         # is artificial) into the CFG. The exits will be Ijk_Call and
         # Ijk_FakeRet, and Ijk_Call always goes first
-        extra_info = { 'is_call_jump' : False,
-                       'call_target': None,
-                       'return_target': None,
-                       'last_call_exit_target': None,
-                       'skip_fakeret': False,
-        }
+        extra_info = {'is_call_jump': False,
+                      'call_target': None,
+                      'return_target': None,
+                      'last_call_exit_target': None,
+                      'skip_fakeret': False,
+                      }
 
         # Post-process jumpkind before touching all_successors
         for suc in all_successors:
@@ -1256,8 +1200,8 @@ class CFG(Analysis, CFGBase):
             l.debug('IRSB 0x%x has an indirect jump as its default exit', simrun.addr)
 
             # Throw away all current paths whose target doesn't make sense
-            old_successors = all_successors[ :: ]
-            all_successors = [ ]
+            old_successors = all_successors[::]
+            all_successors = []
             for i, suc in enumerate(old_successors):
 
                 if suc.se.symbolic(suc.ip):
@@ -1274,40 +1218,71 @@ class CFG(Analysis, CFGBase):
 
                     else:
                         l.info('%s: an obviously incorrect successor %d/%d (%#x) is ditched',
-                                cfg_node,
-                                i + 1, len(old_successors),
-                                ip_int)
+                               cfg_node,
+                               i + 1, len(old_successors),
+                               ip_int)
 
             # We need input states to perform backward slicing
-            if self._enable_advanced_backward_slicing and self._keep_input_state:
-                # TODO: Handle those successors
-                more_successors = self._resolve_indirect_jump(cfg_node, simrun)
+            if self._enable_advanced_backward_slicing and self._keep_state:
 
-                if len(more_successors):
-                    # Remove the symbolic successor
-                    # TODO: Now we are removing all symbolic successors. Is it possible
-                    # TODO: that there is more than one symbolic successor?
-                    all_successors = [ suc for suc in all_successors if
-                                       not suc.se.symbolic(suc.ip) ]
-                    # Insert new successors
-                    # We insert new successors in the beginning of all_successors list so that we don't break the
-                    # assumption that Ijk_FakeRet is always the last element in the list
-                    for suc_addr in more_successors:
-                        a = simrun.default_exit.copy()
-                        a.ip = suc_addr
-                        all_successors.insert(0, a)
-
-                    l.debug('The indirect jump is successfully resolved.')
-
-                    self.resolved_indirect_jumps.add(simrun.addr)
+                # Optimization: make sure we only try to resolve an indirect jump if any of the following criteria holds
+                # - It's a jump (Ijk_Boring), and its target is either fully symbolic, or its resolved target is within
+                #   the current binary
+                # - It's a call (Ijk_Call), and its target is fully symbolic
+                # TODO: This is very hackish, please refactor this part of code later
+                should_resolve = True
+                legit_successors = [suc for suc in all_successors if suc.scratch.jumpkind in ('Ijk_Boring', 'Ijk_Call')]
+                if legit_successors:
+                    legit_successor = legit_successors[0]
+                    if legit_successor.ip.symbolic:
+                        if not legit_successor.scratch.jumpkind == 'Ijk_Call':
+                            should_resolve = False
+                    else:
+                        if legit_successor.scratch.jumpkind == 'Ijk_Call':
+                            should_resolve = False
+                        else:
+                            concrete_target = legit_successor.se.any_int(legit_successor.ip)
+                            if not self.project.loader.addr_belongs_to_object(
+                                    concrete_target) is self.project.loader.main_bin:
+                                should_resolve = False
 
                 else:
-                    l.debug('We failed to resolve the indirect jump.')
-                    self.unresolved_indirect_jumps.add(simrun.addr)
+                    # No interesting successors... skip
+                    should_resolve = False
+
+                # TODO: Handle those successors
+                if not should_resolve:
+                    l.debug("This might not be an indirect jump that has multiple targets. Skipped.")
+
+                else:
+                    more_successors = self._resolve_indirect_jump(cfg_node, simrun, current_function_addr)
+
+                    if len(more_successors):
+                        # Remove the symbolic successor
+                        # TODO: Now we are removing all symbolic successors. Is it possible
+                        # TODO: that there is more than one symbolic successor?
+                        all_successors = [suc for suc in all_successors if
+                                          not suc.se.symbolic(suc.ip)]
+                        # Insert new successors
+                        # We insert new successors in the beginning of all_successors list so that we don't break the
+                        # assumption that Ijk_FakeRet is always the last element in the list
+                        for suc_addr in more_successors:
+                            a = simrun.default_exit.copy()
+                            a.ip = suc_addr
+                            all_successors.insert(0, a)
+
+                        l.debug('The indirect jump is successfully resolved.')
+
+                        self.resolved_indirect_jumps.add(simrun.addr)
+
+                    else:
+                        l.debug('We failed to resolve the indirect jump.')
+                        self.unresolved_indirect_jumps.add(simrun.addr)
 
             else:
                 if not all_successors:
-                    l.debug('We cannot resolve the indirect jump without advanced backward slicing enabled: %s', cfg_node)
+                    l.debug('We cannot resolve the indirect jump without advanced backward slicing enabled: %s',
+                            cfg_node)
 
         # Try to find more successors if we failed to resolve the indirect jump before
         if not error_occured and (cfg_node.is_simprocedure or self._is_indirect_jump(cfg_node, simrun)):
@@ -1356,7 +1331,7 @@ class CFG(Analysis, CFGBase):
                         l.debug("Got %d concrete exits in symbolic mode.", len(all_successors))
                     else:
                         self.unresolved_indirect_jumps.add(simrun.addr)
-                        all_successors = [ ]
+                        all_successors = []
 
                 elif isinstance(simrun, simuvex.SimIRSB) and \
                         any([ex.scratch.jumpkind != 'Ijk_Ret' for ex in all_successors]):
@@ -1366,8 +1341,8 @@ class CFG(Analysis, CFGBase):
                         all_successors = self._symbolically_back_traverse(simrun, simrun_info_collection, cfg_node)
 
                         # Remove successors whose IP doesn't make sense
-                        all_successors = [ suc for suc in all_successors
-                                           if self._is_address_executable(suc.se.exactly_int(suc.ip)) ]
+                        all_successors = [suc for suc in all_successors
+                                          if self._is_address_executable(suc.se.exactly_int(suc.ip))]
 
                         # mark jump as resolved if we got successors
                         if len(all_successors):
@@ -1377,9 +1352,9 @@ class CFG(Analysis, CFGBase):
                         l.debug('Got %d concrete exits in symbolic mode', len(all_successors))
                     else:
                         self.unresolved_indirect_jumps.add(simrun.addr)
-                        all_successors = [ ]
+                        all_successors = []
 
-                elif len(all_successors) > 0 and all([ex.scratch.jumpkind == 'Ijk_Ret' for ex in all_successors ]):
+                elif len(all_successors) > 0 and all([ex.scratch.jumpkind == 'Ijk_Ret' for ex in all_successors]):
                     l.debug('All exits are returns (Ijk_Ret). It will be handled by pending exits.')
 
                 else:
@@ -1424,7 +1399,7 @@ class CFG(Analysis, CFGBase):
                         new_call_stack.stack_suffix(self.context_sensitivity_level),
                         retn_target,
                         False
-                    ) # You can never return to a syscall
+                    )  # You can never return to a syscall
                     exit_targets[simrun_key].append((exit_target_tpl, 'Ijk_Ret', 'default'))
 
             else:
@@ -1448,7 +1423,7 @@ class CFG(Analysis, CFGBase):
                 all_successors.append(copied_successor)
 
         # For debugging purposes!
-        successor_status = { }
+        successor_status = {}
 
         #
         # Then handles each successor state
@@ -1473,7 +1448,7 @@ class CFG(Analysis, CFGBase):
         # Debugging output
         #
 
-        if l.level <= logging.DEBUG:
+        if l.level == logging.DEBUG:
             # Only in DEBUG mode do we process and output all those shit
 
             function_name = self.project.loader.find_symbol_name(simrun.addr)
@@ -1490,9 +1465,11 @@ class CFG(Analysis, CFGBase):
                 else:
                     exit_type_str = "-"
                 try:
-                    l.debug("|    target: 0x%08x %s [%s] %s", suc.se.exactly_int(suc.ip), successor_status[suc], exit_type_str, jumpkind)
+                    l.debug("|    target: 0x%08x %s [%s] %s", suc.se.exactly_int(suc.ip), successor_status[suc],
+                            exit_type_str, jumpkind)
                 except (simuvex.SimValueError, simuvex.SimSolverModeError):
-                    l.debug("|    target cannot be concretized. %s [%s] %s", successor_status[suc], exit_type_str, jumpkind)
+                    l.debug("|    target cannot be concretized. %s [%s] %s", successor_status[suc], exit_type_str,
+                            jumpkind)
             l.debug("%d exits remaining, %d exits pending.", len(remaining_exits), len(pending_exits))
             l.debug("%d unique basic blocks are analyzed so far.", len(analyzed_addrs))
 
@@ -1539,7 +1516,6 @@ class CFG(Analysis, CFGBase):
                 if sim_proc.NO_RET:
                     return
 
-        exit_target = None
         try:
             exit_target = state.se.exactly_n_int(state.ip, 1)[0]
         except (simuvex.SimValueError, simuvex.SimSolverModeError):
@@ -1548,7 +1524,7 @@ class CFG(Analysis, CFGBase):
             if suc_jumpkind == "Ijk_Ret":
                 exit_target = entry_wrapper.call_stack.get_ret_target()
                 if exit_target is not None:
-                    new_initial_state.ip = new_initial_state.BVV(exit_target)
+                    new_initial_state.ip = new_initial_state.se.BVV(exit_target, new_initial_state.arch.bits)
                 else:
                     return
             else:
@@ -1558,7 +1534,8 @@ class CFG(Analysis, CFGBase):
             return
 
         if state.thumb:
-            # Make sure addresses are always odd. It is important to encode this information in the address for the time being.
+            # Make sure addresses are always odd. It is important to encode this information in the address for the
+            # time being.
             exit_target |= 1
 
         if (extra_info['is_call_jump'] and
@@ -1566,11 +1543,12 @@ class CFG(Analysis, CFGBase):
             extra_info['call_target'] = exit_target
 
         if (extra_info['is_call_jump'] and
-                suc_jumpkind == 'Ijk_FakeRet'):
+                    suc_jumpkind == 'Ijk_FakeRet'):
             extra_info['return_target'] = exit_target
 
         # Remove pending targets - type 2
-        tpl = self._generate_simrun_key((None, None), exit_target, suc_jumpkind.startswith('Ijk_Suc')) # TODO: Support other context_sensitivity levels other than 2
+        tpl = self._generate_simrun_key((None, None), exit_target, suc_jumpkind.startswith(
+            'Ijk_Suc'))  # TODO: Support other context_sensitivity levels other than 2
         if tpl in pending_exits:
             l.debug("Removing pending exits (type 2) to %s", hex(exit_target))
             del pending_exits[tpl]
@@ -1591,13 +1569,13 @@ class CFG(Analysis, CFGBase):
 
         # TODO: Make it optional
         if (suc_jumpkind == 'Ijk_Ret' and
-                self._call_depth is not None and
-                len(entry_wrapper.call_stack) <= 1
+                    self._call_depth is not None and
+                    len(entry_wrapper.call_stack) <= 1
             ):
-                # We cannot continue anymore since this is the end of the function where we started tracing
-                l.debug('... reaching the end of the starting function, skip.')
-                successor_status[state] = "Skipped - reaching the end of the starting function"
-                return
+            # We cannot continue anymore since this is the end of the function where we started tracing
+            l.debug('... reaching the end of the starting function, skip.')
+            successor_status[state] = "Skipped - reaching the end of the starting function"
+            return
 
         # Create the new call stack of target block
         new_call_stack = self._create_new_call_stack(addr, all_successor_states,
@@ -1650,7 +1628,7 @@ class CFG(Analysis, CFGBase):
                                   self._context_sensitivity_level,
                                   call_stack=new_call_stack,
                                   bbl_stack=new_bbl_stack
-                                )
+                                  )
                 successor_status[state] = "Appended"
 
             else:
@@ -1670,11 +1648,11 @@ class CFG(Analysis, CFGBase):
             successor_status[state] = "Pended"
 
         elif (suc_jumpkind == 'Ijk_Call' or suc_jumpkind.startswith('Ijk_Sys')) and \
-               (self._call_depth is not None and
-                len(new_call_stack) > self._call_depth and
+                (self._call_depth is not None and
+                         len(new_call_stack) > self._call_depth and
                      (
-                        self._call_tracing_filter is None or
-                        self._call_tracing_filter(state, suc_jumpkind)
+                                     self._call_tracing_filter is None or
+                                 self._call_tracing_filter(state, suc_jumpkind)
                      )
                  ):
             # We skip this call
@@ -1688,9 +1666,9 @@ class CFG(Analysis, CFGBase):
             new_path.state.set_mode('fastpath')
 
             pw = EntryWrapper(new_path,
-                            self._context_sensitivity_level,
-                            call_stack=new_call_stack,
-                            bbl_stack=new_bbl_stack)
+                              self._context_sensitivity_level,
+                              call_stack=new_call_stack,
+                              bbl_stack=new_bbl_stack)
             successor_status[state] = "Appended"
         elif traced_sim_blocks[new_call_stack_suffix][exit_target] >= 1 \
                 and suc_jumpkind == "Ijk_Ret":
@@ -1718,11 +1696,14 @@ class CFG(Analysis, CFGBase):
             # Fix the stack pointer (for example, skip the return address on the stack)
             new_sp_addr = sp_addr + self.project.arch.call_sp_fix
 
-            actions = [ a for a in state.log.actions if a.bbl_addr == current_run.addr ]
+            actions = [a for a in state.log.actions if a.bbl_addr == current_run.addr]
 
             for a in actions:
                 if a.type == "mem" and a.action == "read":
-                    addr = se.exactly_int(a.addr.ast, default=0)
+                    try:
+                        addr = se.exactly_int(a.addr.ast, default=0)
+                    except claripy.ClaripyError:
+                        continue
                     if (self.project.arch.call_pushes_ret and addr >= new_sp_addr) or \
                             (not self.project.arch.call_pushes_ret and addr >= new_sp_addr):
                         # TODO: What if a variable locates higher than the stack is modified as well? We probably want
@@ -1736,7 +1717,8 @@ class CFG(Analysis, CFGBase):
                     elif a.action == "write":
                         accessed_registers.add(offset)
         else:
-            l.error("handle_actions: Function not found, or stack pointer is None. It might indicates unbalanced stack.")
+            l.error(
+                "handle_actions: Function not found, or stack pointer is None. It might indicates unbalanced stack.")
 
     def _detect_loop(self, sim_run, new_tpl, exit_targets,
                      simrun_key, new_call_stack_suffix,
@@ -1757,7 +1739,7 @@ class CFG(Analysis, CFGBase):
                 self._loop_back_edges.append((simrun_key, new_tpl))
         elif new_jumpkind != "Ijk_Call" and new_jumpkind != "Ijk_Ret" and \
                 current_exit_wrapper.bbl_in_stack(
-                                                new_call_stack_suffix, current_function_addr, new_addr):
+                    new_call_stack_suffix, current_function_addr, new_addr):
             '''
             There are two cases:
             # The loop header we found is a single IRSB that doesn't overlap with
@@ -1767,7 +1749,7 @@ class CFG(Analysis, CFGBase):
             as IRSBa could be inside IRSBb if they don't start at the same address but
             end at the same address
             We should take good care of these two cases.
-            ''' #pylint:disable=W0105
+            '''  # pylint:disable=W0105
             # First check if this is an overlapped loop header
             next_irsb = self._nodes[new_tpl]
             assert next_irsb is not None
@@ -1775,7 +1757,7 @@ class CFG(Analysis, CFGBase):
             for k_tpl, v_lst in exit_targets.items():
                 a = self._simrun_key_addr(k_tpl)
                 for v_tpl in v_lst:
-                    b = v_tpl[-2] # The last item is the jumpkind :)
+                    b = v_tpl[-2]  # The last item is the jumpkind :)
                     if b == next_irsb.addr and a != sim_run.addr:
                         other_preds.add(self._nodes[k_tpl])
             if len(other_preds) > 0:
@@ -1820,7 +1802,7 @@ class CFG(Analysis, CFGBase):
 
         return True
 
-    def _resolve_indirect_jump(self, cfgnode, simirsb):
+    def _resolve_indirect_jump(self, cfgnode, simirsb, current_function_addr):
         """
         Try to resolve an indirect jump by slicing backwards
         """
@@ -1829,16 +1811,21 @@ class CFG(Analysis, CFGBase):
 
         # Let's slice backwards from the end of this exit
         next_tmp = simirsb.irsb.next.tmp
+        stmt_id = [i for i, s in enumerate(simirsb.irsb.statements)
+                   if isinstance(s, pyvex.IRStmt.WrTmp) and s.tmp == next_tmp][0]
 
         self._graph = self._create_graph(return_target_sources=self.return_target_sources)
-        bc = self.project.analyses.BackwardSlice(self, None, None, cfgnode, -1)
+        cdg = self.project.analyses.CDG(cfg=self)
+        ddg = self.project.analyses.DDG(cfg=self, start=current_function_addr, call_depth=0)
+
+        bc = self.project.analyses.BackwardSlice(self, cdg, ddg, targets=[(cfgnode, stmt_id)], same_function=True)
         taint_graph = bc.taint_graph
         # Find the correct taint
-        next_nodes = [ n for n in taint_graph.nodes() if n.addr == simirsb.addr and n.type == 'tmp' and n.tmp == next_tmp ]
+        next_nodes = [cl for cl in taint_graph.nodes() if cl.simrun_addr == simirsb.addr]
 
         if not next_nodes:
             l.error('The target exit is not included in the slice. Something is wrong')
-            return [ ]
+            return []
 
         next_node = next_nodes[0]
 
@@ -1848,13 +1835,10 @@ class CFG(Analysis, CFGBase):
         for subgraph in all_subgraphs:
             if next_node in subgraph:
                 # Make sure there is no symbolic read...
-                if any([ n.mem_addr.symbolic for n in subgraph.nodes() if n.type == 'mem' ]):
-                    continue
-
                 # FIXME: This is an over-approximation. We should try to limit the starts more
-                nodes = [ n for n in subgraph.nodes() if subgraph.in_degree(n) == 0]
+                nodes = [n for n in subgraph.nodes() if subgraph.in_degree(n) == 0]
                 for n in nodes:
-                    starts.add(n.addr)
+                    starts.add(n.simrun_addr)
 
         # Execute the slice
         successing_addresses = set()
@@ -1871,51 +1855,38 @@ class CFG(Analysis, CFGBase):
                 base_state.set_mode('symbolic')
                 base_state.ip = start
 
-                # TODO: Tidy this part of code
-                # Clean all taints in the state at this IP
-                if node in bc.initial_taints_per_run:
-                    initial_taints = bc.initial_taints_per_run[node]
-
-                    to_be_unconstrained = [ ]
-
-                    for taint_set in initial_taints:
-                        data_taints = taint_set.data_taints
-                        for data_taint in data_taints:
-                            try:
-                                if bc.is_taint_related_to_ip(data_taint.simrun_addr, data_taint.stmt_idx, 'mem',
-                                                          simrun_whitelist=[ simirsb.addr ]):
-                                    continue
-                                if bc.is_taint_impacting_stack_pointers(data_taint.simrun_addr, data_taint.stmt_idx,
-                                                                        'mem'):
-                                    continue
-                                # Only overwrite it if it's on the stack
-                                simrun_addr = data_taint.address.ast.model.value
-                                if not (
-                                    simrun_addr <= self.project.arch.initial_sp and
-                                    simrun_addr > self.project.arch.initial_sp - self.project.arch.stack_size
-                                ):
-                                    continue
-                            except AngrBackwardSlicingError:
-                                # The taint is not found
-                                # We skip this taint to stay on the safe side
+                # Clear all initial taints (register values, memory values, etc.)
+                initial_nodes = [n for n in bc.taint_graph.nodes() if bc.taint_graph.in_degree(n) == 0]
+                for cl in initial_nodes:
+                    # Iterate in all actions of this node, and pick corresponding actions
+                    cfg_nodes = self.get_all_nodes(cl.simrun_addr)
+                    for n in cfg_nodes:
+                        if not n.final_states:
+                            continue
+                        actions = [ac for ac in n.final_states[0].log.actions
+                                   # Normally it's enough to only use the first final state
+                                   if ac.bbl_addr == cl.simrun_addr and
+                                   ac.stmt_idx == cl.stmt_idx
+                                   ]
+                        for ac in actions:
+                            if not hasattr(ac, 'action'):
                                 continue
-                            to_be_unconstrained.append(data_taint)
-
-                    if len(to_be_unconstrained) > 1:
-                        # Unconstraining too many values may lead to symbolic execution taking too much time to terminate
-                        # For performance concerns, we are only taking the first value here
-                        to_be_unconstrained = to_be_unconstrained[ : 1]
-
-                    for data_taint in to_be_unconstrained:
-                        unconstrained_value = base_state.se.Unconstrained('unconstrained',
-                                                                          data_taint.bits.ast)
-                        base_state.memory.store(data_taint.address,
-                                                unconstrained_value,
-                                                endness=self.project.arch.memory_endness)
+                            if ac.action == 'read':
+                                if ac.type == 'mem':
+                                    unconstrained_value = base_state.se.Unconstrained('unconstrained',
+                                                                                      ac.size.ast * 8)
+                                    base_state.memory.store(ac.addr,
+                                                            unconstrained_value,
+                                                            endness=self.project.arch.memory_endness)
+                                elif ac.type == 'reg':
+                                    unconstrained_value = base_state.se.Unconstrained('unconstrained',
+                                                                                      ac.size.ast * 8)
+                                    base_state.registers.store(ac.offset,
+                                                               unconstrained_value,
+                                                               endness=self.project.arch.register_endness)
 
                 # Clear the constraints!
-                base_state.se._solver.constraints = [ ]
-                base_state.se._solver._result = None
+                base_state.release_plugin('solver_engine')
                 p = self.project.factory.path(base_state)
 
             # For speed concerns, we are limiting the timeout for z3 solver to 5 seconds. It will be restored afterwards
@@ -1948,7 +1919,7 @@ class CFG(Analysis, CFGBase):
         Convert loop_backedges from tuples of simrun keys to real edges in self.graph.
         """
 
-        loop_backedges = [ ]
+        loop_backedges = []
 
         for src_key, dst_key in self._loop_back_edges:
             src = self._nodes[src_key]
@@ -2003,7 +1974,7 @@ class CFG(Analysis, CFGBase):
             end_addr = n.addr + n.size
             end_addresses[(end_addr, n.callstack_key)].append(n)
 
-        while any([ len(x) > 1 for x in end_addresses.itervalues() ]):
+        while any([len(x) > 1 for x in end_addresses.itervalues()]):
             tpl_to_find = (None, None)
             for tpl, x in end_addresses.iteritems():
                 if len(x) > 1:
@@ -2013,9 +1984,9 @@ class CFG(Analysis, CFGBase):
             end_addr, callstack_key = tpl_to_find
             all_nodes = end_addresses[tpl_to_find]
 
-            all_nodes = sorted(all_nodes, key=lambda n: n.size)
+            all_nodes = sorted(all_nodes, key=lambda node: node.size)
             smallest_node = all_nodes[0]
-            other_nodes = all_nodes[ 1 : ]
+            other_nodes = all_nodes[1:]
 
             # Break other nodes
             for n in other_nodes:
@@ -2030,16 +2001,16 @@ class CFG(Analysis, CFGBase):
                 new_node = None
                 tpl = (new_end_addr, n.callstack_key)
                 if tpl in end_addresses:
-                    nodes = [ i for i in end_addresses[tpl] if i.addr == n.addr ]
+                    nodes = [i for i in end_addresses[tpl] if i.addr == n.addr]
                     if len(nodes) > 0:
                         new_node = nodes[0]
 
                 if new_node is None:
                     # Create a new one
-                    new_node = CFGNode(callstack_key, n.addr, new_size, self, function_address=n.function_address)
+                    new_node = CFGNode(n.addr, new_size, self, callstack_key=callstack_key, function_address=n.function_address)
                     # Copy instruction addresses
-                    new_node.instruction_addrs = [ ins_addr for ins_addr in n.instruction_addrs
-                                                   if ins_addr < n.addr + new_size]
+                    new_node.instruction_addrs = [ins_addr for ins_addr in n.instruction_addrs
+                                                  if ins_addr < n.addr + new_size]
                     # Put the newnode into end_addresses
                     end_addresses[tpl].append(new_node)
 
@@ -2053,8 +2024,8 @@ class CFG(Analysis, CFGBase):
                     graph.add_edge(p, new_node, data)
 
                 # We should find the correct successor
-                new_successors = [ i for i in all_nodes
-                                  if i.addr == smallest_node.addr ]
+                new_successors = [i for i in all_nodes
+                                  if i.addr == smallest_node.addr]
                 if new_successors:
                     new_successor = new_successors[0]
                     graph.add_edge(new_node, new_successor, jumpkind='Ijk_Boring')
@@ -2062,20 +2033,20 @@ class CFG(Analysis, CFGBase):
                     # We gotta create a new one
                     l.error('normalize(): Please report it to Fish.')
 
-            end_addresses[tpl_to_find] = [ smallest_node ]
+            end_addresses[tpl_to_find] = [smallest_node]
 
     def unroll_loops(self, max_loop_unrolling_times):
         if not isinstance(max_loop_unrolling_times, (int, long)) or \
-                         max_loop_unrolling_times < 0:
+                        max_loop_unrolling_times < 0:
             raise AngrCFGError('Max loop unrolling times must be set to an integer greater than or equal to 0 if ' +
                                'loop unrolling is enabled.')
 
         # Traverse the CFG and try to find the beginning of loops
-        loop_backedges = [ ]
+        loop_backedges = []
 
         start = self._starts[0]
         if isinstance(start, tuple):
-            start, _ = start # pylint: disable=unpacking-non-sequence
+            start, _ = start  # pylint: disable=unpacking-non-sequence
         start_node = self.get_any_node(start)
         if start_node is None:
             raise AngrCFGError('Cannot find start node when trying to unroll loops. The CFG might be empty.')
@@ -2104,7 +2075,7 @@ class CFG(Analysis, CFGBase):
                 loop_backedges.append(loop_backedge)
 
             # Create a common end node for all nodes whose out_degree is 0
-            end_nodes = [ n for n in graph_copy.nodes_iter() if graph_copy.out_degree(n) == 0 ]
+            end_nodes = [n for n in graph_copy.nodes_iter() if graph_copy.out_degree(n) == 0]
             new_end_node = "end_node"
 
             if len(end_nodes) == 0:
@@ -2120,13 +2091,13 @@ class CFG(Analysis, CFGBase):
             for en in end_nodes:
                 graph_copy.add_edge(en, new_end_node)
 
-            #postdoms = self.immediate_postdominators(new_end_node, target_graph=graph_copy)
-            #reverse_postdoms = defaultdict(list)
-            #for k, v in postdoms.iteritems():
+            # postdoms = self.immediate_postdominators(new_end_node, target_graph=graph_copy)
+            # reverse_postdoms = defaultdict(list)
+            # for k, v in postdoms.iteritems():
             #    reverse_postdoms[v].append(k)
 
             # Find all loop bodies
-            #for src, dst in loop_backedges:
+            # for src, dst in loop_backedges:
             #    nodes_in_loop = { src, dst }
 
             #    while True:
@@ -2148,14 +2119,16 @@ class CFG(Analysis, CFGBase):
 
             graph_copy.remove_node(new_end_node)
             src, dst = loop_backedge
-            if graph_copy.has_edge(src, dst): # It might have been removed before
+            if graph_copy.has_edge(src, dst):  # It might have been removed before
                 # Duplicate the dst node
                 new_dst = dst.copy()
                 new_dst.looping_times = dst.looping_times + 1
-                if (new_dst not in graph_copy # If the new_dst is already in the graph, we don't want to keep unrolling
-                                              # the this loop anymore since it may *create* a new loop. Of course we
-                                              # will lose some edges in this way, but in general it is acceptable.
-                        and new_dst.looping_times <= max_loop_unrolling_times):
+                if (
+                        new_dst not in graph_copy and
+                        # If the new_dst is already in the graph, we don't want to keep unrolling
+                        # the this loop anymore since it may *create* a new loop. Of course we
+                        # will lose some edges in this way, but in general it is acceptable.
+                        new_dst.looping_times <= max_loop_unrolling_times):
                     # Log all successors of the dst node
                     dst_successors = graph_copy.successors(dst)
                     # Add new_dst to the graph
@@ -2183,7 +2156,7 @@ class CFG(Analysis, CFGBase):
         :param pending_exits: A dict of all pending exits
         """
 
-        pending_exits_to_remove = [ ]
+        pending_exits_to_remove = []
 
         for simrun_key, pe in pending_exits.iteritems():
 
@@ -2198,13 +2171,12 @@ class CFG(Analysis, CFGBase):
                           hex(pe.returning_source) if pe.returning_source is not None else 'None')
                 continue
 
-            if func.returning == False:
+            if func.returning is False:
                 # Oops, it's not returning
                 # Remove this pending exit
                 pending_exits_to_remove.append(simrun_key)
 
         for simrun_key in pending_exits_to_remove:
-
             l.debug('Removing a pending exit to 0x%x since the target function 0x%x does not return',
                     self._simrun_key_addr(simrun_key),
                     pending_exits[simrun_key].returning_source,
@@ -2213,10 +2185,10 @@ class CFG(Analysis, CFGBase):
             del pending_exits[simrun_key]
 
     def _analyze_calling_conventions(self):
-        '''
+        """
         Concretely execute part of the function and watch the changes of sp
-        :return:
-        '''
+        :return: None
+        """
 
         l.debug("Analyzing calling conventions of each function.")
 
@@ -2234,8 +2206,8 @@ class CFG(Analysis, CFGBase):
             # Set the calling convention
             func.cc = cc
 
-        #for func in self._function_manager.functions.values():
-        #    l.info(func)
+            # for func in self._function_manager.functions.values():
+            #    l.info(func)
 
     def _analyze_function_features(self):
         """
@@ -2246,8 +2218,8 @@ class CFG(Analysis, CFGBase):
         """
 
         changes = {
-            'functions_return': [ ],
-            'functions_do_not_return': [ ]
+            'functions_return': [],
+            'functions_do_not_return': []
         }
 
         self._graph = self._create_graph()
@@ -2269,8 +2241,8 @@ class CFG(Analysis, CFGBase):
 
             func_transition_graph = func.local_transition_graph
 
-            temporary_local_endpoints = [ a for a in func_transition_graph.nodes()
-                                    if func_transition_graph.out_degree(a) == 0 ]
+            temporary_local_endpoints = [a for a in func_transition_graph.nodes()
+                                         if func_transition_graph.out_degree(a) == 0]
 
             if not temporary_local_endpoints:
                 # It might be empty if our transition graph is fucked up (for example, the freaking
@@ -2278,13 +2250,13 @@ class CFG(Analysis, CFGBase):
                 # transition graph). Just ignore it.
                 continue
 
-            all_endpoints_returning = [ ]
-            temporary_endpoints = [ ]
+            all_endpoints_returning = []
+            temporary_endpoints = []
 
             for local_endpoint in temporary_local_endpoints:
 
                 if local_endpoint in func.transition_graph.nodes():
-                    out_edges = func.transition_graph.out_edges([ local_endpoint ], data=True)
+                    out_edges = func.transition_graph.out_edges([local_endpoint], data=True)
 
                     if not out_edges:
                         temporary_endpoints.append(local_endpoint)
@@ -2319,7 +2291,7 @@ class CFG(Analysis, CFGBase):
 
                     all_endpoints_returning.append(call_target_func.returning)
 
-            if all([ i == False for i in all_endpoints_returning ]):
+            if all([i is False for i in all_endpoints_returning]):
                 # All target functions that this function calls is not returning
                 func.returning = False
                 changes['functions_do_not_return'].append(func)
@@ -2327,13 +2299,13 @@ class CFG(Analysis, CFGBase):
         return changes
 
     def _get_callsites(self, function_address):
-        '''
+        """
         Get where a specific function is called.
         :param function_address:    Address of the target function
         :return:                    A list of CFGNodes whose exits include a call/jump to the given function
-        '''
+        """
 
-        all_predecessors = [ ]
+        all_predecessors = []
 
         nodes = self.get_all_nodes(function_address)
         for n in nodes:
@@ -2343,12 +2315,12 @@ class CFG(Analysis, CFGBase):
         return all_predecessors
 
     def _refine_function_arguments(self, func, callsites):
-        '''
+        """
 
         :param func:
         :param callsites:
         :return:
-        '''
+        """
 
         for i, c in enumerate(callsites):
             # Execute one block ahead of the callsite, and execute one basic block after the callsite
@@ -2368,14 +2340,14 @@ class CFG(Analysis, CFGBase):
             l.debug("Refining %s at 0x%x (%d/%d).", repr(func), c.addr, i, len(callsites))
 
             # Get a basic block ahead of the callsite
-            blocks_ahead = [ c ]
+            blocks_ahead = [c]
 
             # the block after
-            blocks_after = [ ]
+            blocks_after = []
             successors = self.get_successors_and_jumpkind(c, excluding_fakeret=False)
             for s, jk in successors:
                 if jk == 'Ijk_FakeRet':
-                    blocks_after = [ s ]
+                    blocks_after = [s]
                     break
 
             regs_overwritten = set()
@@ -2385,7 +2357,8 @@ class CFG(Analysis, CFGBase):
 
             try:
                 # Execute the predecessor
-                path = self.project.factory.path(self.project.factory.blank_state(mode="fastpath", addr=blocks_ahead[0].addr))
+                path = self.project.factory.path(
+                    self.project.factory.blank_state(mode="fastpath", addr=blocks_ahead[0].addr))
                 all_successors = path.next_run.successors + path.next_run.unsat_successors
                 if len(all_successors) == 0:
                     continue
@@ -2413,7 +2386,8 @@ class CFG(Analysis, CFGBase):
 
             try:
                 if len(blocks_after):
-                    path = self.project.factory.path(self.project.factory.blank_state(mode="fastpath", addr=blocks_after[0].addr))
+                    path = self.project.factory.path(
+                        self.project.factory.blank_state(mode="fastpath", addr=blocks_after[0].addr))
                     all_successors = path.next_run.successors + path.next_run.unsat_successors
                     if len(all_successors) == 0:
                         continue
@@ -2427,7 +2401,7 @@ class CFG(Analysis, CFGBase):
                             regs_written.add(ac.offset)
 
                     # Filter registers, remove unnecessary registers from the set
-                    regs_overwritten = self.project.arch.argument_registers.intersection(regs_overwritten)
+                    # regs_overwritten = self.project.arch.argument_registers.intersection(regs_overwritten)
                     regs_read = self.project.arch.argument_registers.intersection(regs_read)
 
                     func.registers_read_afterwards.add(tuple(regs_read))
@@ -2436,11 +2410,11 @@ class CFG(Analysis, CFGBase):
                 pass
 
     def _remove_non_return_edges(self):
-        '''
+        """
         Remove those return_from_call edges that actually do not return due to
         calling some not-returning functions.
         :return: None
-        '''
+        """
         function_manager = self._function_manager
         for func in function_manager.functions.values():
             graph = func.transition_graph
@@ -2456,7 +2430,7 @@ class CFG(Analysis, CFGBase):
                     # Weird...
                     continue
 
-                if call_func.returning == False:
+                if call_func.returning is False:
                     # Remove that edge!
                     graph.remove_edge(call_func_addr, return_to_addr)
                     # Remove the edge in CFG
@@ -2467,11 +2441,11 @@ class CFG(Analysis, CFGBase):
                             if jumpkind == 'Ijk_FakeRet' and successor.addr == return_to_addr:
                                 self.remove_edge(n, successor)
 
-            # Remove all dangling nodes
-            #wcc = list(networkx.weakly_connected_components(graph))
-            #for nodes in wcc:
-            #    if func.startpoint not in nodes:
-            #        graph.remove_nodes_from(nodes)
+                                # Remove all dangling nodes
+                                # wcc = list(networkx.weakly_connected_components(graph))
+                                # for nodes in wcc:
+                                #    if func.startpoint not in nodes:
+                                #        graph.remove_nodes_from(nodes)
 
     def _immediate_dominators(self, node, target_graph=None, reverse_graph=False):
         if target_graph is None:
@@ -2495,13 +2469,13 @@ class CFG(Analysis, CFGBase):
         order.pop()
         order.reverse()
 
-        def intersect(u, v):
-            while u != v:
-                while dfn[u] < dfn[v]:
-                    u = idom[u]
+        def intersect(u_, v_):
+            while u_ != v_:
+                while dfn[u_] < dfn[v_]:
+                    u_ = idom[u_]
                 while dfn[u] > dfn[v]:
-                    v = idom[v]
-            return u
+                    v_ = idom[v_]
+            return u_
 
         changed = True
         while changed:
@@ -2521,6 +2495,7 @@ class CFG(Analysis, CFGBase):
         return self._immediate_dominators(end, target_graph=target_graph, reverse_graph=True)
 
     def __setstate__(self, s):
+        self.project = s['project']
         self._graph = s['graph']
         self._function_manager = s['function_manager']
         self._loop_back_edges = s['_loop_back_edges']
@@ -2532,20 +2507,22 @@ class CFG(Analysis, CFGBase):
         self._executable_address_ranges = s['_executable_address_ranges']
 
     def __getstate__(self):
-        s = { }
-        s['graph'] = self._graph
-        s['function_manager'] = self._function_manager
-        s['_loop_back_edges'] = self._loop_back_edges
-        s['_nodes'] = self._nodes
-        s['unresolved_indirect_jumps'] = self.unresolved_indirect_jumps
-        s['resolved_indirect_jumps'] = self.resolved_indirect_jumps
-        s['_thumb_addrs'] = self._thumb_addrs
-        s['_unresolvable_runs'] = self._unresolvable_runs
-        s['_executable_address_ranges'] = self._executable_address_ranges
+        s = {
+            'project': self.project,
+            'graph': self._graph,
+            'function_manager': self._function_manager,
+            '_loop_back_edges': self._loop_back_edges,
+            '_nodes': self._nodes,
+            'unresolved_indirect_jumps': self.unresolved_indirect_jumps,
+            'resolved_indirect_jumps': self.resolved_indirect_jumps,
+            '_thumb_addrs': self._thumb_addrs,
+            '_unresolvable_runs': self._unresolvable_runs,
+            '_executable_address_ranges': self._executable_address_ranges,
+        }
 
         return s
 
-    def _get_nx_paths(self, begin,  end):
+    def _get_nx_paths(self, begin, end):
         """
         Get the possible (networkx) simple paths between two nodes or addresses
         corresponding to nodes.
@@ -2564,16 +2541,122 @@ class CFG(Analysis, CFGBase):
 
         return networkx.all_simple_paths(self.graph, n_begin, n_end)
 
-    def get_paths(self, begin, end):
+    def get_paths(self, begin, end, nb_max=0):
         """
         Get all the simple paths between @begin and @end.
-        Returns: a list of angr.Path instances.
+        :param nb_max: Threshold for a maximum of paths to handle
+        :return: a list of angr.Path instances.
         """
         paths = self._get_nx_paths(begin, end)
         a_paths = []
+        if nb_max > 0:
+            paths = itertools.islice(paths, 0, nb_max)
         for p in paths:
             runs = map(self.irsb_from_node, p)
-            a_paths.append(angr.path.make_path(self.project, runs))
+            a_paths.append(make_path(self.project, runs))
         return a_paths
+
+    def _quasi_topological_sort(self):
+        """
+        Perform a quasi-topological sort on an already constructed CFG graph (a networkx DiGraph)
+
+        :return: None
+        """
+
+        # Clear the existing sorting result
+        self._quasi_topological_order = {}
+
+        ctr = self._graph.number_of_nodes()
+
+        for ep in self._entry_points:
+            # FIXME: This is not always correct. We'd better store CFGNodes in self._entry_points
+            ep_node = self.get_any_node(ep)
+
+            if not ep_node:
+                continue
+
+            for n in networkx.dfs_postorder_nodes(self._graph, source=ep_node):
+                if n not in self._quasi_topological_order:
+                    self._quasi_topological_order[n] = ctr
+                    ctr -= 1
+
+    def get_topological_order(self, cfg_node):
+        """
+        Get the topological order of a CFG Node.
+
+        :param cfg_node: A CFGNode instance.
+        :return: An integer representing its order, or None if the CFGNode does not exist in the graph.
+        """
+
+        if len(self._quasi_topological_order) == 0:
+            self._quasi_topological_sort()
+
+        return self._quasi_topological_order.get(cfg_node, None)
+
+    def get_function_subgraph(self, start, max_call_depth=None):
+        """
+        Get a sub-graph of a certain function.
+
+        :param start: The function start. Currently it should be an integer.
+        :param max_call_depth: Call depth limit. None indicates no limit.
+        :return: A CFG instance which is a sub-graph of self.graph
+        """
+
+        # FIXME: syscalls are not supported
+        # FIXME: start should also take a CFGNode instance
+
+        start_node = self.get_any_node(start)
+
+        node_wrapper = (start_node, 0)
+        stack = [node_wrapper]
+        traversed_nodes = {start_node}
+        subgraph_nodes = set([start_node])
+
+        while stack:
+            nw = stack.pop()
+            n, call_depth = nw[0], nw[1]
+
+            # Get successors
+            edges = self.graph.out_edges(n, data=True)
+
+            for _, dst, data in edges:
+                if dst not in traversed_nodes:
+                    # We see a new node!
+                    traversed_nodes.add(dst)
+
+                    if data['jumpkind'] == 'Ijk_Call':
+                        if max_call_depth is None or (max_call_depth is not None and call_depth < max_call_depth):
+                            subgraph_nodes.add(dst)
+                            new_nw = (dst, call_depth + 1)
+                            stack.append(new_nw)
+                    elif data['jumpkind'] == 'Ijk_Ret':
+                        if call_depth > 0:
+                            subgraph_nodes.add(dst)
+                            new_nw = (dst, call_depth - 1)
+                            stack.append(new_nw)
+                    else:
+                        subgraph_nodes.add(dst)
+                        new_nw = (dst, call_depth)
+                        stack.append(new_nw)
+
+        subgraph = networkx.subgraph(self.graph, subgraph_nodes)
+
+        # Make it a CFG instance
+        subcfg = self.copy()
+        subcfg._graph = subgraph
+        subcfg._starts = (start,)
+
+        return subcfg
+
+    def downsize(self):
+        """
+        Remove saved states from all CFGNodes to reduce memory usage.
+
+        :return: None
+        """
+
+        for cfg_node in self._nodes.itervalues():
+            cfg_node.downsize()
+
 
 register_analysis(CFG, 'CFG')
