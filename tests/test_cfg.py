@@ -12,9 +12,9 @@ import os
 test_location = str(os.path.join(os.path.dirname(os.path.realpath(__file__)), '../../binaries/tests'))
 
 def compare_cfg(standard, g, function_list):
-    '''
+    """
     Standard graph comes with addresses only, and it is based on instructions, not on basic blocks
-    '''
+    """
 
     def get_function_name(addr):
         start = 0
@@ -154,27 +154,26 @@ def test_not_returning():
                         use_sim_procedures=True,
                         load_options={'auto_load_libs': False}
                         )
-    cfg = proj.analyses.CFG(context_sensitivity_level=0)
-    function_manager = cfg.function_manager
+    proj.analyses.CFG(context_sensitivity_level=0)
 
     # function_a returns
-    nose.tools.assert_not_equal(function_manager.function(name='function_a'), None)
-    nose.tools.assert_true(function_manager.function(name='function_a').returning)
+    nose.tools.assert_not_equal(proj.kb.functions.function(name='function_a'), None)
+    nose.tools.assert_true(proj.kb.functions.function(name='function_a').returning)
 
     # function_b does not return
-    nose.tools.assert_not_equal(function_manager.function(name='function_b'), None)
-    nose.tools.assert_false(function_manager.function(name='function_b').returning)
+    nose.tools.assert_not_equal(proj.kb.functions.function(name='function_b'), None)
+    nose.tools.assert_false(proj.kb.functions.function(name='function_b').returning)
 
     # function_c does not return
-    nose.tools.assert_not_equal(function_manager.function(name='function_c'), None)
-    nose.tools.assert_false(function_manager.function(name='function_c').returning)
+    nose.tools.assert_not_equal(proj.kb.functions.function(name='function_c'), None)
+    nose.tools.assert_false(proj.kb.functions.function(name='function_c').returning)
 
     # main does not return
-    nose.tools.assert_not_equal(function_manager.function(name='main'), None)
-    nose.tools.assert_false(function_manager.function(name='main').returning)
+    nose.tools.assert_not_equal(proj.kb.functions.function(name='main'), None)
+    nose.tools.assert_false(proj.kb.functions.function(name='main').returning)
 
     # function_d should not be reachable
-    nose.tools.assert_equal(function_manager.function(name='function_d'), None)
+    nose.tools.assert_equal(proj.kb.functions.function(name='function_d'), None)
 
 def disabled_cfg_5():
     binary_path = test_location + "/mipsel/busybox"
@@ -189,8 +188,8 @@ def test_cfg_6():
     proj = angr.Project(binary_path,
                         use_sim_procedures=True,
                         load_options={'auto_load_libs': False})
-    cfg = proj.analyses.CFG(context_sensitivity_level=1)
-    nose.tools.assert_greater_equal(len(cfg.function_manager.functions), 92)
+    proj.analyses.CFG(context_sensitivity_level=1)
+    nose.tools.assert_greater_equal(len(proj.kb.functions), 58)
     simuvex.o.modes['fastpath'] ^= {simuvex.s_options.DO_CCALLS}
 
 def test_fauxware():
@@ -230,10 +229,55 @@ def test_thumb_mode():
         check_addr(a)
 
     # Functions in function manager
-    functions = cfg.function_manager.functions
-    for f_addr, f in functions.items():
+    for f_addr, f in p.kb.functions.items():
         check_addr(f_addr)
-        check_addr(f.startpoint)
+        if f.startpoint is not None:
+            check_addr(f.startpoint.addr)
+
+def test_fakeret_edges_0():
+
+    # Test the bug where a fakeret edge can be missing in certain cases
+    # Reported by Attila Axt (GitHub: @axt)
+    # Ref: https://github.com/angr/angr/issues/72
+
+    binary_path = os.path.join(test_location, "x86_64", "cfg_3")
+
+    p = angr.Project(binary_path)
+    cfg = p.analyses.CFGAccurate(context_sensitivity_level=3)
+
+    putchar = cfg.functions.function(name="putchar")
+
+    # Since context sensitivity is 3, there should be two different putchar nodes
+    putchar_cfgnodes = cfg.get_all_nodes(putchar.addr)
+    nose.tools.assert_equal(len(putchar_cfgnodes), 2)
+
+    # Each putchar node has a different predecessor as their PLT entry
+    plt_entry_0 = cfg.get_predecessors(putchar_cfgnodes[0])
+    nose.tools.assert_equal(len(plt_entry_0), 1)
+    plt_entry_0 = plt_entry_0[0]
+
+    plt_entry_1 = cfg.get_predecessors(putchar_cfgnodes[1])
+    nose.tools.assert_equal(len(plt_entry_1), 1)
+    plt_entry_1 = plt_entry_1[0]
+
+    nose.tools.assert_true(plt_entry_0 is not plt_entry_1)
+
+    # Each PLT entry should have a FakeRet edge
+    preds_0 = cfg.get_predecessors(plt_entry_0)
+    nose.tools.assert_equal(len(preds_0), 1)
+    preds_1 = cfg.get_predecessors(plt_entry_1)
+    nose.tools.assert_equal(len(preds_1), 1)
+
+    # Each predecessor must have a call edge and a FakeRet edge
+    edges_0 = cfg.get_successors_and_jumpkind(preds_0[0], excluding_fakeret=False)
+    nose.tools.assert_equal(len(edges_0), 2)
+    jumpkinds = set([ jumpkind for _, jumpkind in edges_0 ])
+    nose.tools.assert_set_equal(jumpkinds, { 'Ijk_Call', 'Ijk_FakeRet' })
+
+    edges_1 = cfg.get_successors_and_jumpkind(preds_1[0], excluding_fakeret=False)
+    nose.tools.assert_equal(len(edges_1), 2)
+    jumpkinds = set([ jumpkind for _, jumpkind in edges_1 ])
+    nose.tools.assert_set_equal(jumpkinds, { 'Ijk_Call', 'Ijk_FakeRet' })
 
 def run_all():
     functions = globals()

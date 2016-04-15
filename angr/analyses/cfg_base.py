@@ -5,6 +5,9 @@ from ..errors import AngrCFGError
 l = logging.getLogger(name="angr.cfg_base")
 
 class CFGBase(object):
+    """
+    The base class for control flow graphs.
+    """
     def __init__(self, project, context_sensitivity_level):
         self._project = project
 
@@ -14,7 +17,6 @@ class CFGBase(object):
         self._edge_map = None
         self._loop_back_edges = None
         self._overlapped_loop_headers = None
-        self._function_manager = None
         self._thumb_addrs = set()
         if context_sensitivity_level < 0:
             raise Exception("Unsupported context sensitivity level %d" % context_sensitivity_level)
@@ -28,9 +30,9 @@ class CFGBase(object):
         return self._context_sensitivity_level
 
     def _initialize_cfg(self):
-        '''
+        """
         Re-create the DiGraph
-        '''
+        """
         self._graph = networkx.DiGraph()
 
     # pylint: disable=no-self-use
@@ -47,15 +49,25 @@ class CFGBase(object):
     def get_bbl_dict(self):
         return self._nodes
 
-    def get_predecessors(self, basic_block, excluding_fakeret=True):
+    def get_predecessors(self, cfgnode, excluding_fakeret=True):
+        """
+        Get predecessors of a node on the control flow graph.
+
+        :param CFGNode cfgnode: The node
+        :param bool excluding_fakeret: True if you want to exclude all predecessors that is connected to the node with
+                                       a fakeret edge.
+        :return: A list of predecessors
+        :rtype: list
+        """
+
         if not excluding_fakeret:
-            if basic_block in self._graph:
-                return self._graph.predecessors(basic_block)
+            if cfgnode in self._graph:
+                return self._graph.predecessors(cfgnode)
             else:
                 return []
         else:
             predecessors = []
-            for pred, _, data in self._graph.in_edges_iter([basic_block], data=True):
+            for pred, _, data in self._graph.in_edges_iter([cfgnode], data=True):
                 jumpkind = data['jumpkind']
                 if jumpkind != 'Ijk_FakeRet':
                     predecessors.append(pred)
@@ -81,6 +93,17 @@ class CFGBase(object):
             if not excluding_fakeret or data['jumpkind'] != 'Ijk_FakeRet':
                 successors.append((suc, data['jumpkind']))
         return successors
+
+    def get_all_predecessors(self, cfgnode):
+        """
+        Get all predecessors of a specific node on the control flow graph.
+
+        :param CFGNode cfgnode: The CFGNode object
+        :return: A list of predecessors in the CFG
+        :rtype: list
+        """
+
+        return networkx.dfs_predecessors(self._graph, cfgnode)
 
     def get_all_successors(self, basic_block):
         return networkx.dfs_successors(self._graph, basic_block)
@@ -143,17 +166,17 @@ class CFGBase(object):
         return self._project.factory.sim_run(cfg_node.input_state)
 
     def irsb_from_node(self, cfg_node):
-        '''
+        """
         Create SimRun from a CFGNode object.
-        '''
+        """
         return self._get_irsb(cfg_node)
 
     def get_any_irsb(self, addr):
-        '''
+        """
         Returns a SimRun of a certain address. If there are many SimRuns with the same address in CFG,
         return an arbitrary one.
         You should never assume this method returns a specific one.
-        '''
+        """
         cfg_node = self.get_any_node(addr)
 
         return self._get_irsb(cfg_node)
@@ -179,9 +202,9 @@ class CFGBase(object):
         return results
 
     def get_all_irsbs(self, addr):
-        '''
+        """
         Returns all SimRuns of a certain address, without considering contexts.
-        '''
+        """
 
         nodes = self.get_all_nodes(addr)
 
@@ -202,9 +225,9 @@ class CFGBase(object):
         return irsb_addr_set
 
     def get_branching_nodes(self):
-        '''
+        """
         Returns all nodes that has an out degree >= 2
-        '''
+        """
         nodes = set()
         for n in self._graph.nodes():
             if self._graph.out_degree(n) >= 2:
@@ -234,10 +257,6 @@ class CFGBase(object):
 
         if edge in self._graph:
             self._graph.remove_edge(edge)
-
-    @property
-    def function_manager(self):
-        return self._function_manager
 
     def is_thumb_addr(self, addr):
         return addr in self._thumb_addrs
